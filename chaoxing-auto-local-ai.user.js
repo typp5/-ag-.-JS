@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习通 · 本地模型自动刷课
 // @namespace    cx-local-ai
-// @version      1.6.6
+// @version      1.6.8
 // @description  超星/学习通：自动播放、防暂停、自动下一节；自动解超星字体混淆、章节测验/作业/视频弹窗题交给 AI 作答（本地 Ollama 或 DeepSeek/Kimi/硅基流动/OpenAI），并统计 token 用量
 // @author       洄
 // @license      MIT
@@ -1750,10 +1750,33 @@
     } catch (e) { return false; }
   }
 
+  // 超星换节时不会把上一节的播放器 iframe 拆掉，只是把它藏起来。
+  // 不判断这一层，脚本就会在一个看不见的 iframe 里把上一节的视频再播一遍。
+  function frameIsVisible() {
+    try {
+      const fe = window.frameElement;
+      if (!fe) return true;                       // 顶层
+      if (fe.getClientRects().length === 0) return false;
+      const st = getComputedStyle(fe);
+      return st.display !== 'none' && st.visibility !== 'hidden' && st.opacity !== '0';
+    } catch (e) { return true; }
+  }
+
+  function mediaVisible(el) {
+    try {
+      if (!el || el.getClientRects().length === 0) return false;
+      const st = getComputedStyle(el);
+      return st.display !== 'none' && st.visibility !== 'hidden';
+    } catch (e) { return true; }
+  }
+
   function detectJob() {
     if (!document.body) return null;
-    // 只有最内层那一帧才管视频，否则父子帧会抢着播
-    if (document.querySelector('video, audio') && !hasChildMedia()) return 'video';
+    if (!frameIsVisible()) return null;           // 自己这一帧已经被藏起来了，别动手
+
+    // 只有最内层那一帧才管视频，否则父子帧会抢着播；而且必须真的看得见
+    const media = document.querySelector('video, audio');
+    if (media && !hasChildMedia() && mediaVisible(media)) return 'video';
 
     // 作业页里常夹着一个空的 .TiMu，不能见到 .TiMu 就当章节测验：比数量
     const tiMu = document.querySelectorAll('.TiMu').length;
@@ -1860,10 +1883,21 @@
     if (nextBtn && visible(nextBtn)) {
       try {
         nextBtn.click();
-        // 有未完成任务点时会弹「是否去学习」
+        // 有未完成任务点时会弹「当前章节还有任务点未完成，是否去学习」。
+        // 这里必须选「下一节」——点「去学习」会跳回没做完的那个视频，
+        // 表现就是「下一节失效，又开始播视频」。
         setTimeout(() => {
-          const go = document.querySelector('.jobFinishTip .nextbutton');
-          if (go && visible(go)) { try { go.click(); } catch (e) { /* 忽略 */ } }
+          const tip = document.querySelector('.jobFinishTip, #jobFinishTip, .popDiv');
+          if (!tip || !visible(tip)) return;
+
+          const nextInTip = tip.querySelector('.nextChapter, .jb_btn.nextChapter, a.jb_btn');
+          if (nextInTip && visible(nextInTip) && /下一节|下一章/.test(txt(nextInTip))) {
+            try { nextInTip.click(); return; } catch (e) { /* 忽略 */ }
+          }
+
+          const cands = Array.from(tip.querySelectorAll('a,div,span,button'));
+          const byText = cands.find((x) => /^(下一节|下一章|继续下一节)$/.test(txt(x)));
+          if (byText) { try { byText.click(); } catch (e) { /* 忽略 */ } }
         }, 1200);
         return 'nextBtn';
       } catch (e) { /* 忽略 */ }
@@ -1885,6 +1919,9 @@
       } else {
         target = nodes.find((n) => unfinishedOf(n) > 0) || nodes[0];
       }
+
+      // 绝不点自己：点了等于原地重载，视频会从头再播一遍
+      if (target && cur && nodeChapterId(target) === cur) target = null;
 
       if (target) {
         try { target.scrollIntoView({ block: 'center' }); } catch (e) { /* 忽略 */ }
@@ -1965,7 +2002,7 @@
     wrap.className = 'wrap';
     wrap.innerHTML = `
       <div class="hd">
-        <b>本地模型刷课</b><span class="ver">v1.6.6</span><span class="st" id="st">待机</span><span class="sp"></span>
+        <b>本地模型刷课</b><span class="ver">v1.6.8</span><span class="st" id="st">待机</span><span class="sp"></span>
         <button class="mini" id="fold">－</button>
       </div>
       <div class="bd" id="bd">
@@ -2321,6 +2358,8 @@
       return;
     }
 
+    const sigBefore = currentChapterId() + '|' + activeTaskTabIndex();
+
     let moved = null;
     for (let i = 0; i < 3 && !moved; i++) {
       moved = goNext();
@@ -2336,6 +2375,15 @@
 
     const movedLabel = { taskpoint: '下一个任务点', nextBtn: '下一节按钮', catalog: '目录节点', tab: '章标签' }[moved] || moved;
     log('已跳转（' + movedLabel + '）', 'ok');
+
+    // 跳完确认一下真的换节了：没换说明按钮/弹窗没点对，早一点报出来
+    setTimeout(() => {
+      const sigAfter = currentChapterId() + '|' + activeTaskTabIndex();
+      if (sigAfter === sigBefore) {
+        log('跳转没生效（章节和任务点都没变），等下一轮重试；如果反复出现，把「诊断」那行发我', 'warn');
+      }
+    }, 4000);
+
     watchNextJob();
   }
 
@@ -2441,6 +2489,7 @@
 
     // 任务点是切标签/翻页动态加载的，不能只找一次
     let ranKey = '';
+    const doneKeys = new Set();   // 同一个（章节 + 任务点 + 类型）只做一次
 
     while (true) {
       await sleep(1200);
@@ -2451,8 +2500,12 @@
       const job = detectJob();
       if (!job) continue;
 
-      const key = job + '|' + (location.href || '') + '|' + document.body.children.length;
-      if (key === ranKey) continue;
+      // 章节 id 一起进 key：换节之后哪怕旧 iframe 还在，也不会再被当成新任务
+      let chapter = '';
+      try { chapter = top.document.querySelector('#curChapterId') ? top.document.querySelector('#curChapterId').value : ''; } catch (e) { /* 跨域就算了 */ }
+
+      const key = job + '|' + chapter + '|' + (location.href || '') + '|' + document.body.children.length;
+      if (key === ranKey || doneKeys.has(key)) continue;
       ranKey = key;
 
       if (job === 'chapter' && !CFG.answerChapterTest) {
@@ -2472,6 +2525,7 @@
       } catch (e) {
         log('任务出错：' + e.message, 'err');
       }
+      doneKeys.add(key);
 
       post('job-done', { job: job });
       await sleep(2000);
@@ -2504,6 +2558,9 @@
       diagnose: diagnose,
       runRead: runRead,
       decodeFont: decodeCxFont,
+      detectJob: detectJob,
+      frameIsVisible: frameIsVisible,
+      mediaVisible: mediaVisible,
       tokens: TOK,
       usageLine: usageLine
     };
